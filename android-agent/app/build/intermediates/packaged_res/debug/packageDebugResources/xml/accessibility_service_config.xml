@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    AccessibilityService configuration.
+
+    packageNames  — limits events to WhatsApp only (performance).
+    eventTypes    — the specific events we care about:
+      TYPE_NOTIFICATION_STATE_CHANGED: notification posted (backup path)
+      TYPE_WINDOW_CONTENT_CHANGED:     UI tree changed (detect new messages)
+      TYPE_WINDOWS_CHANGED:            WhatsApp window appears / disappears
+    flags         — REQUEST_FILTER_KEY_EVENTS: not needed; omit to reduce overhead.
+    feedbackType  — FEEDBACK_GENERIC (we don't provide user feedback)
+    notificationTimeout — 100 ms throttle between callbacks.
+    canRetrieveWindowContent — MUST be true to read UI tree.
+-->
+<accessibility-service
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeNotificationStateChanged|typeWindowContentChanged|typeWindowsChanged|typeViewClicked"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:notificationTimeout="100"
+    android:canRetrieveWindowContent="true"
+    android:canPerformGestures="false"
+    android:description="@string/accessibility_service_description" />
