@@ -96,24 +96,39 @@ class AgentForegroundService : Service() {
     // ─── Public API (called from NLS / Accessibility) ─────────
 
     /**
-     * Short-lived dedup map: "contactPhone:content" → timestamp.
-     * Prevents the same message being enqueued twice when both NLS and a11y
-     * pick it up within a short window (they produce different idempotency keys
-     * because their timestamps differ).
+     * Short-lived dedup maps:
+     *  • [recentKeys] → guards against the exact same idempotency key being
+     *    enqueued twice (e.g. A11y reading the same bubble twice in a row
+     *    within the same second).
+     *  • [recentContent] → 800 ms window keyed by "contactName:content".
+     *    Catches the race where NLS and A11y pick up the same message with
+     *    slightly different timestamps (→ different idempotency keys).
+     *    The window is intentionally tiny so legitimate rapid repeats
+     *    ("1", "1", "1") from the user still pass through.
      */
-    private val recentContentKeys = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val recentKeys = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val recentContent = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     /** Enqueues a captured WhatsApp message for delivery to the backend. */
     fun enqueueEvent(event: MessageEvent) {
-        val contentKey = "${event.contactPhone}:${event.content}"
         val now = System.currentTimeMillis()
-        val prev = recentContentKeys.put(contentKey, now)
-        if (prev != null && now - prev < 5_000) {
-            Log.d(TAG, "dedup: skipping duplicate event within 5s: ${event.content.take(30)}")
+
+        val prevKey = recentKeys.put(event.idempotencyKey, now)
+        if (prevKey != null && now - prevKey < 60_000) {
+            Log.d(TAG, "dedup: duplicate idempotency key: ${event.idempotencyKey.take(12)}…")
             return
         }
+
+        val contentKey = "${event.direction}:${event.contactName}:${event.content}"
+        val prevContent = recentContent.put(contentKey, now)
+        if (prevContent != null && now - prevContent < 800) {
+            Log.d(TAG, "dedup: same content within 800ms: ${event.content.take(30)}")
+            return
+        }
+
         // Clean old entries periodically.
-        recentContentKeys.entries.removeIf { now - it.value > 60_000 }
+        recentKeys.entries.removeIf { now - it.value > 300_000 }
+        recentContent.entries.removeIf { now - it.value > 10_000 }
 
         scope.launch {
             localQueue.enqueue(event)

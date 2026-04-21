@@ -124,6 +124,30 @@ class WhatsAppAccessibilityService : AccessibilityService() {
 
     // ─── READ: new messages while WA is in foreground ─────────
 
+    /**
+     * Set of bubble fingerprints we've already reported. A fingerprint is
+     * derived from the bubble's contentDescription (which in WA contains
+     * timestamp + sender + text — unique per message), falling back to text
+     * when description is blank. We keep a bounded window of the last N
+     * fingerprints so memory stays small.
+     */
+    private val seenBubbleKeys = java.util.LinkedHashSet<String>()
+    private val maxSeenKeys = 100
+
+    private fun markSeen(key: String) {
+        if (seenBubbleKeys.add(key)) {
+            while (seenBubbleKeys.size > maxSeenKeys) {
+                val it = seenBubbleKeys.iterator()
+                if (it.hasNext()) { it.next(); it.remove() }
+            }
+        }
+    }
+
+    private fun bubbleFingerprint(node: AccessibilityNodeInfo, text: String): String {
+        val desc = node.contentDescription?.toString()?.trim().orEmpty()
+        return if (desc.isNotBlank()) desc else "txt:$text"
+    }
+
     private fun tryReadNewMessages(waPackage: String) {
         val root = rootInActiveWindow ?: return
         try {
@@ -137,38 +161,47 @@ class WhatsAppAccessibilityService : AccessibilityService() {
             val contactPhone = extractCurrentChatPhone(root) ?: ""
             val contactName  = extractCurrentChatName(root) ?: ""
 
-            // Collect texts of all visible bubbles from bottom (newest) up.
-            // Stop when we hit a message we've already seen.
-            val newMessages = mutableListOf<Pair<String, Boolean>>() // text, isSent
-            for (i in (childCount - 1) downTo 0) {
+            // Walk bubbles TOP-DOWN (oldest → newest) so that events are
+            // emitted in chronological order even when several new bubbles
+            // appeared between two reads. For each bubble we compute a stable
+            // fingerprint from its contentDescription (includes timestamp +
+            // sender + text in WA) and skip already-seen ones.
+            data class NewMsg(val text: String, val isSent: Boolean, val key: String)
+            val newMessages = mutableListOf<NewMsg>()
+            for (i in 0 until childCount) {
                 val child = listRoot.getChild(i) ?: continue
                 val text = collectText(child).trim()
                 if (text.isBlank()) continue
-                if (text == lastSeenContent) break  // already seen this one — stop
-                if (recentlySent.any { it == text }) continue  // skip our own automated sends
+
+                val key = bubbleFingerprint(child, text)
+                if (seenBubbleKeys.contains(key)) continue
+                if (recentlySent.any { it == text }) {
+                    // Our own automated send — remember so we don't re-read
+                    // it if the description is blank.
+                    markSeen(key)
+                    continue
+                }
+
                 val isSent = isOutgoingBubble(child)
-                newMessages.add(text to isSent)
+                newMessages.add(NewMsg(text, isSent, key))
             }
 
             if (newMessages.isEmpty()) return
 
-            // Update lastSeenContent to the newest message (first in list = bottom of chat).
-            lastSeenContent = newMessages.first().first
-
-            // Send events oldest-first (reverse since we collected newest-first).
-            for ((text, isSent) in newMessages.reversed()) {
+            for (msg in newMessages) {
+                markSeen(msg.key)
                 val ts = DateTimeFormatter.ISO_INSTANT.format(Instant.now())
                 val event = MessageEvent(
                     idempotencyKey = IdempotencyKey.compute(
-                        AgentForegroundService.deviceId, contactPhone, text, ts
+                        AgentForegroundService.deviceId, contactPhone, msg.text, ts
                     ),
                     contactName  = contactName,
                     contactPhone = contactPhone,
-                    content      = text,
-                    direction    = if (isSent) Direction.OUT else Direction.IN,
+                    content      = msg.text,
+                    direction    = if (msg.isSent) Direction.OUT else Direction.IN,
                     timestamp    = ts,
                 )
-                Log.d(TAG, "a11y read msg: [${event.direction}] ${text.take(40)}")
+                Log.d(TAG, "a11y read msg: [${event.direction}] ${msg.text.take(40)}")
                 AgentForegroundService.instance?.enqueueEvent(event)
             }
         } finally {
