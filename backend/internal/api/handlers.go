@@ -211,6 +211,14 @@ func (h *handlers) getConversation(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid id", http.StatusBadRequest)
 		return
 	}
+	if changed, err := h.repo.MarkConversationRead(r.Context(), convID); err == nil && changed {
+		if updated, err := h.repo.GetConversation(r.Context(), convID); err == nil {
+			h.hub.BroadcastJSON(models.WSEnvelope{
+				Type:    models.EventTypeConversationUpd,
+				Payload: mustMarshalRaw(models.ConvUpdatedPayload{Conversation: *updated}),
+			})
+		}
+	}
 	conv, err := h.repo.GetConversation(r.Context(), convID)
 	if err != nil {
 		jsonError(w, "not found", http.StatusNotFound)
@@ -272,6 +280,14 @@ func (h *handlers) listMessages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		jsonError(w, "invalid id", http.StatusBadRequest)
 		return
+	}
+	if changed, err := h.repo.MarkConversationRead(r.Context(), convID); err == nil && changed {
+		if updated, err := h.repo.GetConversation(r.Context(), convID); err == nil {
+			h.hub.BroadcastJSON(models.WSEnvelope{
+				Type:    models.EventTypeConversationUpd,
+				Payload: mustMarshalRaw(models.ConvUpdatedPayload{Conversation: *updated}),
+			})
+		}
 	}
 	limit := queryInt(r, "limit", 100)
 	offset := queryInt(r, "offset", 0)

@@ -215,6 +215,20 @@ func (r *Repository) UpdateConversationLastMessage(ctx context.Context, convID u
 	return err
 }
 
+// MarkConversationRead clears unread counter for a conversation.
+// Returns true when counter was changed.
+func (r *Repository) MarkConversationRead(ctx context.Context, convID uuid.UUID) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE conversations
+		SET unread_count = 0,
+		    updated_at = NOW()
+		WHERE id = $1 AND unread_count > 0`, convID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 func (r *Repository) AssignOperator(ctx context.Context, convID, operatorID uuid.UUID) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE conversations SET assigned_operator_id = $1 WHERE id = $2`,

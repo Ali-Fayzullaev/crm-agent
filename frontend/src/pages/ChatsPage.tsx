@@ -41,6 +41,12 @@ export default function ChatsPage() {
       setActiveConv(null);
       return;
     }
+
+    // Optimistic clear to avoid stale unread badge while data is loading.
+    setConversations((prev) =>
+      prev.map((c) => (c.id === conversationId ? { ...c, unread_count: 0 } : c)),
+    );
+
     setLoadingMsgs(true);
     Promise.all([
       fetchMessages(conversationId).then(setMessages).catch(() => {}),
@@ -74,7 +80,7 @@ export default function ChatsPage() {
             last_message_at: msg.created_at,
             unread_count:
               msg.conversation_id === conversationId
-                ? prev[idx].unread_count
+                ? 0
                 : prev[idx].unread_count + (msg.direction === 'in' ? 1 : 0),
           };
           return [updated, ...prev.slice(0, idx), ...prev.slice(idx + 1)];
@@ -101,9 +107,20 @@ export default function ChatsPage() {
         if (prev.some((m) => m.id === msg.id)) return prev;
         return [...prev, msg];
       });
+      setConversations((prev) => {
+        const idx = prev.findIndex((c) => c.id === conversationId);
+        if (idx === -1) return prev;
+        const updated: Conversation = {
+          ...prev[idx],
+          last_message_text: msg.content,
+          last_message_at: msg.created_at,
+          unread_count: 0,
+        };
+        return [updated, ...prev.slice(0, idx), ...prev.slice(idx + 1)];
+      });
       setReply('');
-    } catch {
-      /* toast */
+    } catch (err) {
+      console.error('sendReply failed', err);
     } finally {
       setSending(false);
     }
@@ -157,11 +174,11 @@ export default function ChatsPage() {
   return (
     <>
       <div
-        className={`flex w-96 flex-col border-r border-gray-200 bg-white ${
+        className={`flex w-[390px] flex-col border-r border-gray-200 bg-white ${
           conversationId ? 'hidden md:flex' : 'flex'
         }`}
       >
-        <div className="border-b border-gray-100 px-5 pb-3 pt-5">
+        <div className="border-b border-gray-100 bg-gradient-to-b from-emerald-50/70 to-white px-5 pb-3 pt-5">
           <div className="mb-3 flex items-center justify-between">
             <h2 className="text-xl font-bold text-gray-900">Чаты</h2>
             <span className="rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600">
@@ -204,7 +221,7 @@ export default function ChatsPage() {
                   key={c.id}
                   to={`/chat/${c.id}`}
                   className={`flex items-center gap-3 border-b border-gray-50 px-4 py-3 transition ${
-                    active ? 'bg-emerald-50/60' : 'hover:bg-gray-50'
+                    active ? 'bg-emerald-50/80 ring-1 ring-inset ring-emerald-100' : 'hover:bg-gray-50'
                   }`}
                 >
                   <Avatar name={name} size={44} />
@@ -252,7 +269,7 @@ export default function ChatsPage() {
       {conversationId ? (
         <div
           className="flex flex-1 flex-col"
-          style={{ background: 'linear-gradient(135deg, #f0fdf4 0%, #f0f9ff 100%)' }}
+          style={{ background: 'linear-gradient(140deg, #ecfeff 0%, #f0fdf4 45%, #f8fafc 100%)' }}
         >
           <div className="flex items-center gap-3 border-b border-gray-200 bg-white/90 px-5 py-3 backdrop-blur">
             <Link to="/" className="md:hidden">
