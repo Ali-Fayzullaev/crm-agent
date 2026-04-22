@@ -306,30 +306,43 @@ class WhatsAppAccessibilityService : AccessibilityService() {
         navigateToMainScreen()
         delay(400)
 
-        if (!openChatByName(cmd.contactName)) {
-            Log.w(TAG, "chat not found: '${cmd.contactName}'")
+        val searchKeys = buildSearchKeys(cmd)
+        var chatOpened = openChatBySearchKeys(searchKeys)
+        if (!chatOpened) {
+            // WA may have been backgrounded by system/UI transitions. Retry once.
+            if (ensureWhatsAppForeground()) {
+                delay(800)
+                navigateToMainScreen()
+                delay(300)
+                chatOpened = openChatBySearchKeys(searchKeys)
+            }
+        }
+        if (!chatOpened) {
+            Log.w(TAG, "chat not found: '${cmd.contactName}', keys=$searchKeys")
             notifyCommandFailed(cmd, "chat not found")
             return
         }
-        delay(900)
+        delay(1500)
 
         // Verify the chat we opened actually matches the target.
-        val root = rootInActiveWindow
-        val opened = root?.let { extractCurrentChatName(it) }?.trim() ?: ""
-        root?.recycle()
-        if (opened.isBlank() || !namesMatch(opened, cmd.contactName)) {
+        // Only fail if the name is readable AND clearly wrong.
+        // If blank, WA may still be transitioning — proceed optimistically.
+        val verifyRoot = rootInActiveWindow
+        val opened = verifyRoot?.let { extractCurrentChatName(it) }?.trim() ?: ""
+        verifyRoot?.recycle()
+        if (opened.isNotBlank() && !searchKeys.any { namesMatch(opened, it) }) {
             Log.w(TAG, "opened wrong chat: '$opened' ≠ '${cmd.contactName}'")
             notifyCommandFailed(cmd, "wrong chat opened")
             return
         }
 
-        if (!setInputText(cmd.content)) {
+        if (!waitForInputAndType(cmd.content, maxAttempts = 20, delayMs = 300)) {
             notifyCommandFailed(cmd, "input field not found")
             return
         }
-        delay(250)
+        delay(400)
 
-        val sent = attemptClickSend(maxAttempts = 12, delayMs = 250)
+        val sent = attemptClickSend(maxAttempts = 16, delayMs = 300)
         if (sent) {
             Log.i(TAG, "sent '${cmd.contactName}' cmd=${cmd.commandId}")
             notifyCommandSent(cmd)
@@ -350,7 +363,7 @@ class WhatsAppAccessibilityService : AccessibilityService() {
 
         val currentChatName = extractCurrentChatName(root)
         if (currentChatName == null) { root.recycle(); return false }
-        if (!namesMatch(currentChatName, cmd.contactName)) {
+        if (!buildSearchKeys(cmd).any { namesMatch(currentChatName, it) }) {
             Log.d(TAG, "fast-path: wrong chat '$currentChatName' ≠ '${cmd.contactName}'")
             root.recycle()
             return false
@@ -376,11 +389,10 @@ class WhatsAppAccessibilityService : AccessibilityService() {
     }
 
     private fun namesMatch(a: String, b: String): Boolean {
-        val x = a.trim()
-        val y = b.trim()
-        return x.equals(y, ignoreCase = true)
-            || x.contains(y, ignoreCase = true)
-            || y.contains(x, ignoreCase = true)
+        val x = normalizeSearchValue(a)
+        val y = normalizeSearchValue(b)
+        if (x.isBlank() || y.isBlank()) return false
+        return x == y || x.contains(y) || y.contains(x)
     }
 
     /**
@@ -426,8 +438,15 @@ class WhatsAppAccessibilityService : AccessibilityService() {
                 || root.findAccessibilityNodeInfosByViewId("com.whatsapp:id/menuitem_search").isNotEmpty()
                 || findNodeByDesc(root, listOf("Search", "Поиск", "Іздеу")) != null
 
+            // If there is no conversation input/header, we are likely already
+            // not in a concrete chat screen — avoid backing out to launcher.
+            val inChatScreen = root.findAccessibilityNodeInfosByViewId(WA_INPUT_FIELD).isNotEmpty()
+                || root.findAccessibilityNodeInfosByViewId(WA_INPUT_FIELD_B).isNotEmpty()
+                || root.findAccessibilityNodeInfosByViewId("com.whatsapp:id/conversation_contact_name").isNotEmpty()
+                || root.findAccessibilityNodeInfosByViewId("com.whatsapp.w4b:id/conversation_contact_name").isNotEmpty()
+
             root.recycle()
-            if (onMain) {
+            if (onMain || !inChatScreen) {
                 Log.d(TAG, "on WA main screen")
                 return
             }
@@ -442,17 +461,32 @@ class WhatsAppAccessibilityService : AccessibilityService() {
      * Opens a chat by contact name using WhatsApp's search UI.
      * Tries multiple times because the search icon and result list need a moment to appear.
      */
-    private suspend fun openChatByName(name: String): Boolean {
+    private suspend fun openChatBySearchKeys(searchKeys: List<String>): Boolean {
+        if (searchKeys.isEmpty()) return false
+
+        val root = rootInActiveWindow ?: return false
+        val pkg = root.packageName?.toString() ?: ""
+        root.recycle()
+        if (pkg !in WA_PACKAGES) {
+            Log.w(TAG, "openChatBySearchKeys aborted: not in WA (pkg=$pkg)")
+            return false
+        }
+
         // 1. Click the search action in the toolbar.
         if (!clickSearchIcon(maxAttempts = 8, delayMs = 250)) return false
         delay(400)
 
-        // 2. Find the search EditText and type contact name.
-        if (!typeIntoSearchField(name)) return false
-        delay(700)  // wait for results
-
-        // 3. Tap the first conversation row in results.
-        return clickFirstChatResult(name, maxAttempts = 8, delayMs = 250)
+        // 2. Try several query variants because WhatsApp titles and CRM names
+        // may differ slightly.
+        for (query in searchKeys) {
+            Log.d(TAG, "search query='$query'")
+            if (!typeIntoSearchField(query)) continue
+            delay(1200)
+            if (clickFirstChatResult(searchKeys, maxAttempts = 10, delayMs = 300)) {
+                return true
+            }
+        }
+        return false
     }
 
     private suspend fun clickSearchIcon(maxAttempts: Int, delayMs: Long): Boolean {
@@ -463,6 +497,13 @@ class WhatsAppAccessibilityService : AccessibilityService() {
         repeat(maxAttempts) {
             val root = rootInActiveWindow
             if (root != null) {
+                val pkg = root.packageName?.toString() ?: ""
+                if (pkg !in WA_PACKAGES) {
+                    root.recycle()
+                    delay(delayMs)
+                    return@repeat
+                }
+
                 for (id in candidateIds) {
                     val nodes = root.findAccessibilityNodeInfosByViewId(id)
                     val node = nodes.firstOrNull()
@@ -489,6 +530,9 @@ class WhatsAppAccessibilityService : AccessibilityService() {
     private fun typeIntoSearchField(text: String): Boolean {
         val root = rootInActiveWindow ?: return false
         try {
+            val pkg = root.packageName?.toString() ?: ""
+            if (pkg !in WA_PACKAGES) return false
+
             val candidateIds = listOf(
                 "com.whatsapp.w4b:id/search_src_text",
                 "com.whatsapp:id/search_src_text",
@@ -522,24 +566,62 @@ class WhatsAppAccessibilityService : AccessibilityService() {
         }
     }
 
-    private suspend fun clickFirstChatResult(name: String, maxAttempts: Int, delayMs: Long): Boolean {
-        repeat(maxAttempts) {
-            val root = rootInActiveWindow
-            if (root != null) {
-                // Look for a TextView matching the contact name (case-insensitive).
-                val match = findNodeByText(root, name)
-                if (match != null) {
-                    // Click the row (climb up to a clickable ancestor).
-                    var n: AccessibilityNodeInfo? = match
-                    while (n != null && !n.isClickable) n = n.parent
-                    val target = n ?: match
-                    val ok = target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                    root.recycle()
-                    if (ok) return true
+    private suspend fun clickFirstChatResult(searchKeys: List<String>, maxAttempts: Int, delayMs: Long): Boolean {
+        repeat(maxAttempts) { attempt ->
+            val root = rootInActiveWindow ?: run {
+                delay(delayMs)
+                return@repeat
+            }
+            val pkg = root.packageName?.toString() ?: ""
+            if (pkg !in WA_PACKAGES) {
+                root.recycle()
+                delay(delayMs)
+                return@repeat
+            }
+
+            var clicked = false
+            try {
+                // Strategy 1: click first visible chat row container by known view IDs.
+                clicked = clickFirstChatRowContainer(root)
+
+                // Strategy 2: find by text and click safely (avoids RecyclerView/ListView).
+                if (!clicked) {
+                    val match = findBestChatResult(root, searchKeys)
+                        ?: findFirstSearchResultFallback(root)
+                    if (match != null) {
+                        clicked = clickChatResultSafely(match)
+                    }
                 }
+            } finally {
                 root.recycle()
             }
+
+            if (clicked) {
+                Log.d(TAG, "clickFirstChatResult: clicked on attempt $attempt")
+                return true
+            }
             delay(delayMs)
+        }
+        return false
+    }
+
+    /**
+     * Climbs the accessibility tree from [start] looking for a clickable node,
+     * but stops before clicking a RecyclerView or ListView (those scroll, not navigate).
+     */
+    private fun clickChatResultSafely(start: AccessibilityNodeInfo): Boolean {
+        var n: AccessibilityNodeInfo? = start
+        var hops = 0
+        while (n != null && hops < 6) {
+            val cls = n.className?.toString() ?: ""
+            val isScrollContainer = cls.endsWith("RecyclerView") || cls.endsWith("ListView")
+                || cls.endsWith("ScrollView") || cls.endsWith("NestedScrollView")
+            if (isScrollContainer) break  // never click scroll containers
+            if (n.isClickable && n.isEnabled) {
+                if (n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            }
+            n = n.parent
+            hops++
         }
         return false
     }
@@ -562,10 +644,248 @@ class WhatsAppAccessibilityService : AccessibilityService() {
         }
     }
 
+    /**
+     * Robustly wait for the chat input field to appear and type [text] into it.
+     * After opening a chat via search, WA Business may still be animating,
+     * or a search-inside-chat overlay may be active, hiding the regular input.
+     * This polls for the input field; if not found after half the attempts,
+     * it presses Back once to dismiss any lingering search overlay.
+     * Before SET_TEXT we FOCUS + CLICK the field so WA accepts the input.
+     */
+    private suspend fun waitForInputAndType(text: String, maxAttempts: Int, delayMs: Long): Boolean {
+        var dismissedSearch = false
+        repeat(maxAttempts) { attempt ->
+            val root = rootInActiveWindow
+            if (root == null) { delay(delayMs); return@repeat }
+
+            val pkg = root.packageName?.toString() ?: ""
+            if (pkg !in WA_PACKAGES) {
+                root.recycle()
+                delay(delayMs)
+                return@repeat
+            }
+
+            var input: AccessibilityNodeInfo? = root
+                .findAccessibilityNodeInfosByViewId(WA_INPUT_FIELD)
+                .firstOrNull()
+                ?: root.findAccessibilityNodeInfosByViewId(WA_INPUT_FIELD_B).firstOrNull()
+
+            if (input == null) {
+                // Don't fall back to arbitrary EditText — it may be a search box.
+                // Try dismissing overlay after a few failed attempts.
+                root.recycle()
+                if (!dismissedSearch && attempt == maxAttempts / 2) {
+                    Log.d(TAG, "input not found, pressing Back to dismiss overlay")
+                    performGlobalAction(GLOBAL_ACTION_BACK)
+                    dismissedSearch = true
+                    delay(500)
+                } else {
+                    delay(delayMs)
+                }
+                return@repeat
+            }
+
+            // Focus + click the input so WA's compose layer is ready.
+            input.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            if (!input.isFocused) input.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+
+            val args = android.os.Bundle().apply {
+                putCharSequence(
+                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                    text,
+                )
+            }
+            val ok = input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            root.recycle()
+            if (ok) {
+                // Verify the text actually landed in the field.
+                delay(150)
+                val verifyRoot = rootInActiveWindow
+                val verify = verifyRoot?.findAccessibilityNodeInfosByViewId(WA_INPUT_FIELD)?.firstOrNull()
+                    ?: verifyRoot?.findAccessibilityNodeInfosByViewId(WA_INPUT_FIELD_B)?.firstOrNull()
+                val landed = verify?.text?.toString()?.contains(text) == true
+                verifyRoot?.recycle()
+                if (landed) {
+                    Log.d(TAG, "input text set on attempt $attempt")
+                    return true
+                }
+                Log.d(TAG, "SET_TEXT returned ok but text didn't land, retrying")
+            }
+            delay(delayMs)
+        }
+        return false
+    }
+
     private fun findNodeByText(root: AccessibilityNodeInfo, text: String): AccessibilityNodeInfo? {
         val matches = root.findAccessibilityNodeInfosByText(text)
         return matches.firstOrNull { it.text?.toString().equals(text, ignoreCase = true) }
             ?: matches.firstOrNull()
+    }
+
+    private fun findBestChatResult(root: AccessibilityNodeInfo, searchKeys: List<String>): AccessibilityNodeInfo? {
+        val normalizedKeys = searchKeys
+            .map(::normalizeSearchValue)
+            .filter { it.isNotBlank() }
+        if (normalizedKeys.isEmpty()) return null
+
+        // First try Android's native text index.
+        for (raw in searchKeys) {
+            val q = raw.trim()
+            if (q.isBlank()) continue
+            val matches = root.findAccessibilityNodeInfosByText(q)
+            val best = matches.firstOrNull { node ->
+                val t = normalizeSearchValue(node.text?.toString().orEmpty())
+                val d = normalizeSearchValue(node.contentDescription?.toString().orEmpty())
+                val c = (t + " " + d).trim()
+                c.isNotBlank() && normalizedKeys.any { k -> c.contains(k) || k.contains(c) }
+            } ?: matches.firstOrNull()
+            if (best != null) return best
+        }
+
+        fun walk(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+            val text = node.text?.toString().orEmpty()
+            val desc = node.contentDescription?.toString().orEmpty()
+            val candidate = normalizeSearchValue("$text $desc")
+            if (candidate.isNotBlank() && normalizedKeys.any { key -> candidate.contains(key) || key.contains(candidate) }) {
+                return node
+            }
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                walk(child)?.let { return it }
+            }
+            return null
+        }
+
+        return walk(root)
+    }
+
+    private fun findFirstSearchResultFallback(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val candidateIds = listOf(
+            "com.whatsapp.w4b:id/conversations_row_contact_name",
+            "com.whatsapp:id/conversations_row_contact_name",
+            "com.whatsapp.w4b:id/contact_row_label",
+            "com.whatsapp:id/contact_row_label",
+        )
+
+        for (id in candidateIds) {
+            val n = root.findAccessibilityNodeInfosByViewId(id).firstOrNull()
+            if (n != null) return n
+        }
+
+        // Last resort: pick first visible text node that doesn't look like a search box hint.
+        fun walk(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+            val text = normalizeSearchValue(node.text?.toString().orEmpty())
+            if (text.isNotBlank() && text.length >= 3 && !text.contains("search") && !text.contains("поиск")) {
+                return node
+            }
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                walk(child)?.let { return it }
+            }
+            return null
+        }
+
+        return walk(root)
+    }
+
+    private fun clickFirstChatRowContainer(root: AccessibilityNodeInfo): Boolean {
+        val rowIds = listOf(
+            "com.whatsapp.w4b:id/conversations_row",
+            "com.whatsapp:id/conversations_row",
+            "com.whatsapp.w4b:id/conversations_row_content",
+            "com.whatsapp:id/conversations_row_content",
+            "com.whatsapp.w4b:id/contact_row_container",
+            "com.whatsapp:id/contact_row_container",
+        )
+
+        for (id in rowIds) {
+            val node = root.findAccessibilityNodeInfosByViewId(id).firstOrNull() ?: continue
+            if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                Log.d(TAG, "clicked chat row by id=$id")
+                return true
+            }
+        }
+
+        // Fallback: find the first item in any RecyclerView/ListView (search results list)
+        val firstItem = findFirstListItem(root)
+        if (firstItem != null) {
+            Log.d(TAG, "clicking first list item: cls=${firstItem.className} text='${firstItem.text}'")
+            if (clickChatResultSafely(firstItem)) return true
+        }
+
+        return false
+    }
+
+    /** Finds the first child of a RecyclerView or ListView that has meaningful text content. */
+    private fun findFirstListItem(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        fun walk(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+            val cls = node.className?.toString() ?: ""
+            if ((cls.endsWith("RecyclerView") || cls.endsWith("ListView")) && node.childCount > 0) {
+                // Skip header/divider children (no real text), return first with content.
+                for (i in 0 until node.childCount) {
+                    val child = node.getChild(i) ?: continue
+                    if (collectText(child).trim().length > 2) return child
+                }
+                return node.getChild(0)
+            }
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                walk(child)?.let { return it }
+            }
+            return null
+        }
+        return walk(root)
+    }
+
+    private fun clickNodeOrAncestor(start: AccessibilityNodeInfo): Boolean {
+        var n: AccessibilityNodeInfo? = start
+        var hops = 0
+        while (n != null && hops < 8) {
+            if (n.isClickable) {
+                if (n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            }
+            n = n.parent
+            hops++
+        }
+        // Last chance: click the node itself even if not reported clickable.
+        return start.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+    }
+
+    private fun buildSearchKeys(cmd: DeviceCommand): List<String> {
+        val out = linkedSetOf<String>()
+
+        fun add(value: String?) {
+            val trimmed = value?.trim().orEmpty()
+            if (trimmed.isBlank()) return
+            out += trimmed
+
+            val normalized = trimmed.removePrefix("name:").trim()
+            if (normalized.isNotBlank()) out += normalized
+
+            normalized.split(Regex("\\s+"))
+                .map { it.trim() }
+                .filter { it.length >= 3 }
+                .forEach { out += it }
+        }
+
+        add(cmd.contactName)
+        add(cmd.contactPhone)
+        return out.toList()
+    }
+
+    private fun normalizeSearchValue(value: String): String {
+        return value
+            .removePrefix("name:")
+            .lowercase()
+            .map { ch ->
+                when {
+                    ch.isLetterOrDigit() || ch.isWhitespace() -> ch
+                    else -> ' '
+                }
+            }
+            .joinToString("")
+            .replace(Regex("\\s+"), " ")
+            .trim()
     }
 
     private fun findNodeByDesc(root: AccessibilityNodeInfo, descs: List<String>): AccessibilityNodeInfo? {
